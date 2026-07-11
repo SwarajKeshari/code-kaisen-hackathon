@@ -1,8 +1,8 @@
-import mongoose from 'mongoose';
+const mongoose = require('mongoose');
 
 const notificationSchema = new mongoose.Schema({
-  recipient: { type: mongoose.Schema.Types.ObjectId, ref: 'User' }, // Target User
-  recipientDepartment: { type: mongoose.Schema.Types.ObjectId, ref: 'Department' }, // Target Department (for group alerts)
+  recipient: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+  recipientDepartment: { type: mongoose.Schema.Types.ObjectId, ref: 'Department' },
   title: { type: String, required: true },
   message: { type: String, required: true },
   type: { type: String, enum: ['Conflict', 'PermitStatus', 'ComplaintStatus', 'General'], required: true },
@@ -16,4 +16,4 @@ const notificationSchema = new mongoose.Schema({
 notificationSchema.index({ recipient: 1, isRead: 1 });
 notificationSchema.index({ recipientDepartment: 1, isRead: 1 });
 
-export default mongoose.model('Notification', notificationSchema);
+module.exports = mongoose.model('Notification', notificationSchema);

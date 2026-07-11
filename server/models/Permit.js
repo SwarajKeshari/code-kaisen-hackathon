@@ -1,5 +1,5 @@
-import mongoose from 'mongoose';
-import softDeletePlugin from '../plugins/softDelete.js';
+const mongoose = require('mongoose');
+const softDeletePlugin = require('../plugins/softDelete');
 
 const permitSchema = new mongoose.Schema({
   permitNumber: { type: String, required: true, unique: true },
@@ -15,11 +15,11 @@ const permitSchema = new mongoose.Schema({
     type: { type: String, enum: ['LineString'], required: true, default: 'LineString' },
     coordinates: { type: [[Number]], required: true } // Array of [longitude, latitude] pairs
   },
-  radius: { type: Number, required: true, min: 10, max: 1000 }, // Affected spatial zone in meters
+  radius: { type: Number, required: true, min: 10, max: 1000 },
   purpose: { type: String, required: true, minlength: 10 },
   startDate: { type: Date, required: true },
   endDate: { type: Date, required: true },
-  depth: { type: Number, required: true, min: 0.1 }, // In meters
+  depth: { type: Number, required: true, min: 0.1 },
   restorationPlan: { type: String, required: true },
   status: { type: String, required: true, enum: ['Pending', 'Approved', 'Active', 'Completed', 'Conflict', 'Rejected', 'Suspended'], default: 'Pending' },
   isJointExcavationSuggested: { type: Boolean, default: false },
@@ -34,4 +34,4 @@ permitSchema.index({ isDeleted: 1 });
 
 permitSchema.plugin(softDeletePlugin);
 
-export default mongoose.model('Permit', permitSchema);
+module.exports = mongoose.model('Permit', permitSchema);
