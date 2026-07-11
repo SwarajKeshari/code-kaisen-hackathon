@@ -22,6 +22,9 @@ export function SiteNav() {
           <NavLink to="/coordination">Coordination</NavLink>
           <NavLink to="/report">Report Issue</NavLink>
           {user && <NavLink to="/dashboard">Dashboard</NavLink>}
+          {user && (user.role === 'admin' || user.role === 'super_admin') && (
+            <NavLink to="/analytics">Analytics</NavLink>
+          )}
         </nav>
         <div className="flex items-center gap-2">
           {user ? (

@@ -1,4 +1,4 @@
-import mongoose from 'mongoose';
+const mongoose = require('mongoose');
 
 const wardSchema = new mongoose.Schema({
   zone: { type: mongoose.Schema.Types.ObjectId, ref: 'Zone', required: true },
@@ -8,6 +8,7 @@ const wardSchema = new mongoose.Schema({
     type: { type: String, enum: ['Polygon'], required: true, default: 'Polygon' },
     coordinates: { type: [[[Number]]], required: true }
   },
+  defaultDepartment: { type: mongoose.Schema.Types.ObjectId, ref: 'Department', default: null },
   isDeleted: { type: Boolean, default: false }
 }, { timestamps: true });
 
@@ -15,4 +16,4 @@ wardSchema.index({ boundary: '2dsphere' });
 wardSchema.index({ zone: 1 });
 wardSchema.index({ isDeleted: 1 });
 
-export default mongoose.model('Ward', wardSchema);
+module.exports = mongoose.model('Ward', wardSchema);
