@@ -13,6 +13,10 @@ const io = new Server(server, {
   }
 });
 
+const whatsappRoutes = require("./routes/whatsapp.routes");
+
+app.use("/webhook", whatsappRoutes);
+
 // Middleware
 app.use(cors());
 app.use(express.json());
