@@ -14,6 +14,7 @@ import { Route as ReportRouteImport } from './routes/report'
 import { Route as DashboardRouteImport } from './routes/dashboard'
 import { Route as CoordinationRouteImport } from './routes/coordination'
 import { Route as AuthRouteImport } from './routes/auth'
+import { Route as AnalyticsRouteImport } from './routes/analytics'
 import { Route as IndexRouteImport } from './routes/index'
 
 const ReportsRoute = ReportsRouteImport.update({
@@ -41,6 +42,11 @@ const AuthRoute = AuthRouteImport.update({
   path: '/auth',
   getParentRoute: () => rootRouteImport,
 } as any)
+const AnalyticsRoute = AnalyticsRouteImport.update({
+  id: '/analytics',
+  path: '/analytics',
+  getParentRoute: () => rootRouteImport,
+} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
@@ -49,6 +55,7 @@ const IndexRoute = IndexRouteImport.update({
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
+  '/analytics': typeof AnalyticsRoute
   '/auth': typeof AuthRoute
   '/coordination': typeof CoordinationRoute
   '/dashboard': typeof DashboardRoute
@@ -57,6 +64,7 @@ export interface FileRoutesByFullPath {
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
+  '/analytics': typeof AnalyticsRoute
   '/auth': typeof AuthRoute
   '/coordination': typeof CoordinationRoute
   '/dashboard': typeof DashboardRoute
@@ -66,6 +74,7 @@ export interface FileRoutesByTo {
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
+  '/analytics': typeof AnalyticsRoute
   '/auth': typeof AuthRoute
   '/coordination': typeof CoordinationRoute
   '/dashboard': typeof DashboardRoute
@@ -75,12 +84,26 @@ export interface FileRoutesById {
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
   fullPaths:
-    '/' | '/auth' | '/coordination' | '/dashboard' | '/report' | '/reports'
+    | '/'
+    | '/analytics'
+    | '/auth'
+    | '/coordination'
+    | '/dashboard'
+    | '/report'
+    | '/reports'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/auth' | '/coordination' | '/dashboard' | '/report' | '/reports'
+  to:
+    | '/'
+    | '/analytics'
+    | '/auth'
+    | '/coordination'
+    | '/dashboard'
+    | '/report'
+    | '/reports'
   id:
     | '__root__'
     | '/'
+    | '/analytics'
     | '/auth'
     | '/coordination'
     | '/dashboard'
@@ -90,6 +113,7 @@ export interface FileRouteTypes {
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
+  AnalyticsRoute: typeof AnalyticsRoute
   AuthRoute: typeof AuthRoute
   CoordinationRoute: typeof CoordinationRoute
   DashboardRoute: typeof DashboardRoute
@@ -134,6 +158,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/analytics': {
+      id: '/analytics'
+      path: '/analytics'
+      fullPath: '/analytics'
+      preLoaderRoute: typeof AnalyticsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
     '/': {
       id: '/'
       path: '/'
@@ -146,6 +177,7 @@ declare module '@tanstack/react-router' {
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
+  AnalyticsRoute: AnalyticsRoute,
   AuthRoute: AuthRoute,
   CoordinationRoute: CoordinationRoute,
   DashboardRoute: DashboardRoute,

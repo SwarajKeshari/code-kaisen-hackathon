@@ -71,5 +71,25 @@ export const api = {
   works: {
     getAll: () => fetchWithAuth('/works'),
     create: (data: any) => fetchWithAuth('/works', { method: 'POST', body: JSON.stringify(data) }),
+  },
+  complaints: {
+    create: (formData: FormData) => fetchWithAuth('/complaints', { method: 'POST', body: formData }),
+    getAll: () => fetchWithAuth('/complaints'),
+    getById: (id: string) => fetchWithAuth(`/complaints/${id}`),
+    updateStatus: (id: string, status: string, note?: string) => 
+      fetchWithAuth(`/complaints/${id}/status`, { method: 'PATCH', body: JSON.stringify({ status, note }) }),
+    rate: (id: string, rating: number, comment?: string) => 
+      fetchWithAuth(`/complaints/${id}/rate`, { method: 'POST', body: JSON.stringify({ rating, comment }) }),
+    confirmTriage: (id: string, departmentId: string, note?: string) => 
+      fetchWithAuth(`/complaints/${id}/confirm-triage`, { method: 'POST', body: JSON.stringify({ departmentId, note }) }),
+    reassign: (id: string, departmentId: string, note?: string) => 
+      fetchWithAuth(`/complaints/${id}/reassign`, { method: 'PATCH', body: JSON.stringify({ departmentId, note }) }),
+  },
+  auditLogs: {
+    getAll: () => fetchWithAuth('/complaints/audit-logs'),
+  },
+  assistant: {
+    ask: (question: string) => 
+      fetchWithAuth('/assistant/ask', { method: 'POST', body: JSON.stringify({ question }) }),
   }
 };

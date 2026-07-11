@@ -1,30 +1,38 @@
-import express from 'express';
-import {
+const express = require('express');
+const router = express.Router();
+const { requireAuth, requireRole } = require('../middleware/authMiddleware');
+const upload = require('../middleware/uploadMiddleware');
+const {
   createComplaint,
   getComplaints,
   getComplaintById,
   updateComplaintStatus,
   rateComplaint,
-} from '../controllers/complaintController.js';
-import { protect, authorize } from '../middleware/auth.js';
-import upload, { handleImageUpload } from '../middleware/upload.js';
-import { handleValidationErrors } from '../validations/authValidation.js';
-import {
-  createComplaintRules,
-  updateComplaintStatusRules,
-  submitFeedbackRules,
-} from '../validations/complaintValidation.js';
-
-const router = express.Router();
+  confirmTriage,
+  reassignComplaint,
+  getAuditLogs
+} = require('../controllers/complaintController');
 
 router.route('/')
-  .post(protect, authorize('Citizen', 'Super Admin'), upload.single('photo'), handleImageUpload, createComplaintRules, handleValidationErrors, createComplaint)
-  .get(protect, getComplaints);
+  .post(requireAuth, upload.single('photo'), createComplaint)
+  .get(requireAuth, getComplaints);
+
+router.route('/audit-logs')
+  .get(requireAuth, getAuditLogs);
 
 router.route('/:id')
-  .get(protect, getComplaintById);
+  .get(requireAuth, getComplaintById);
 
-router.put('/:id/status', protect, authorize('Department Officer', 'Super Admin'), updateComplaintStatusRules, handleValidationErrors, updateComplaintStatus);
-router.post('/:id/feedback', protect, authorize('Citizen'), submitFeedbackRules, handleValidationErrors, rateComplaint);
+router.route('/:id/status')
+  .patch(requireAuth, requireRole(['officer', 'dept_admin', 'admin', 'super_admin']), updateComplaintStatus);
 
-export default router;
+router.route('/:id/rate')
+  .post(requireAuth, rateComplaint);
+
+router.route('/:id/confirm-triage')
+  .post(requireAuth, requireRole(['admin', 'super_admin']), confirmTriage);
+
+router.route('/:id/reassign')
+  .patch(requireAuth, requireRole(['officer', 'dept_admin', 'admin', 'super_admin']), reassignComplaint);
+
+module.exports = router;

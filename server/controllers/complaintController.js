@@ -1,305 +1,557 @@
-import crypto from 'crypto';
-import ComplaintRepository from '../repositories/ComplaintRepository.js';
-import DepartmentRepository from '../repositories/DepartmentRepository.js';
-import NotificationRepository from '../repositories/NotificationRepository.js';
-import ActivityLogRepository from '../repositories/ActivityLogRepository.js';
-import ComplaintTimeline from '../models/ComplaintTimeline.js';
-import Feedback from '../models/Feedback.js';
-import AppError from '../utils/appError.js';
-import { getIO } from '../sockets/socketHandler.js';
-import logger from '../utils/logger.js';
+const Complaint = require('../models/Complaint');
+const ComplaintTimeline = require('../models/ComplaintTimeline');
+const Permit = require('../models/Permit');
+const Ward = require('../models/Ward');
+const Department = require('../models/Department');
+const AuditLog = require('../models/AuditLog');
+const User = require('../models/User');
+const Notification = require('../models/Notification');
+const photoAnalysisService = require('../services/photoAnalysisService');
+const openaiAssistantService = require('../services/openaiAssistantService');
 
-// Helper to auto-assign department based on complaint type
-const autoAssignDepartment = async (complaintType) => {
-  let targetCode = 'PWD';
-
-  switch (complaintType) {
-    case 'Water Leakage':
-      targetCode = 'WATER';
-      break;
-    case 'Cable Exposure':
-      targetCode = 'TELE';
-      break;
-    case 'Unauthorized Digging':
-    case 'Road Damage':
-    case 'Debris Accumulation':
-      targetCode = 'PWD';
-      break;
-    case 'Electricity':
-      targetCode = 'ELEC';
-      break;
-    default:
-      targetCode = 'PWD';
-      break;
+// Helper to map UI issue categories to backend Complaint types
+function mapCategoryToType(cat) {
+  switch (cat) {
+    case 'pothole': return 'Road Damage';
+    case 'waterlogging': return 'Water Leakage';
+    case 'garbage': return 'Debris Accumulation';
+    case 'blockage': return 'Cable Exposure';
+    case 'pollution': return 'Other';
+    case 'streetlight': return 'Other';
+    default: return 'Other';
   }
+}
 
-  const dept = await DepartmentRepository.findByCode(targetCode);
-  return dept ? dept._id : null;
-};
-
-// @desc    Report a new complaint
-// @route   POST /api/complaints
-// @access  Private (Citizen / Admin)
-export const createComplaint = async (req, res, next) => {
+// Background photo analysis logic
+async function analyzeComplaintPhotoInBackground(complaintId, io) {
   try {
-    const { description, latitude, longitude, ward, complaintType, priority } = req.body;
+    const complaint = await Complaint.findById(complaintId);
+    if (!complaint || !complaint.photoUrl) return;
 
-    const assignedDeptId = await autoAssignDepartment(complaintType);
-    if (!assignedDeptId) {
-      return next(new AppError('Could not auto-assign department. Check database configuration.', 500, 'SERVER_ERROR'));
+    console.log(`Starting background AI analysis for complaint ${complaint.complaintNumber}...`);
+    let analysis;
+    try {
+      analysis = await photoAnalysisService.analyzeImage(complaint.photoUrl);
+    } catch (apiErr) {
+      console.error(`AI photo analysis failed for ${complaint.complaintNumber}:`, apiErr.message);
+      complaint.aiReviewStatus = 'not_analyzed';
+      await complaint.save();
+      
+      if (io) {
+        io.emit('complaint:analyzed', { complaintId, status: 'not_analyzed' });
+      }
+      return;
     }
 
-    const photoUrl = req.fileUrl || ''; // Passed from Multer/upload middleware if any
-    const complaintNumber = `CMP-${crypto.randomInt(100000, 999999)}`;
+    complaint.aiCategory = analysis.category;
+    complaint.aiSeverity = analysis.severity;
+    complaint.aiConfidence = analysis.confidence;
+    complaint.aiDescription = analysis.description;
 
-    const complaint = await ComplaintRepository.create({
+    const confidenceThreshold = parseFloat(process.env.AI_CONFIDENCE_THRESHOLD) || 0.75;
+    
+    // Ensure AI system user exists for audit log trail
+    let aiUser = await User.findOne({ email: 'ai_auto_router@bhopal.gov.in' });
+    if (!aiUser) {
+      aiUser = await User.create({
+        email: 'ai_auto_router@bhopal.gov.in',
+        password: 'ai_system_password_123',
+        fullName: 'auto_routed_by_ai',
+        role: 'admin'
+      });
+    }
+
+    if (analysis.confidence >= confidenceThreshold && analysis.category !== 'other') {
+      // 1. Auto-routing based on category mapping
+      let targetDeptName = '';
+      let fallbackDeptName = '';
+      
+      switch (analysis.category) {
+        case 'pothole':
+        case 'broken_road':
+          targetDeptName = 'PWD';
+          fallbackDeptName = 'PWD';
+          break;
+        case 'open_sewer':
+        case 'waterlogging':
+          targetDeptName = 'Jal Sansadhan';
+          fallbackDeptName = 'Water';
+          break;
+        case 'exposed_wiring':
+          targetDeptName = 'Discom';
+          fallbackDeptName = 'Electricity';
+          break;
+        case 'debris_blockage':
+          targetDeptName = 'Smart City/Metro';
+          fallbackDeptName = 'BMC';
+          break;
+        default:
+          targetDeptName = 'BMC';
+          fallbackDeptName = 'BMC';
+      }
+
+      let deptDoc = await Department.findOne({ name: targetDeptName });
+      if (!deptDoc && fallbackDeptName) {
+        deptDoc = await Department.findOne({ name: fallbackDeptName });
+      }
+
+      if (deptDoc) {
+        const previousDeptId = complaint.department;
+        complaint.department = deptDoc._id;
+        complaint.aiReviewStatus = 'auto_routed';
+        
+        const note = `Auto-routed to ${deptDoc.name} by AI (Category: ${analysis.category}, Confidence: ${(analysis.confidence * 100).toFixed(0)}%)`;
+        
+        // Append Timeline Entry
+        await ComplaintTimeline.create({
+          complaint: complaint._id,
+          actor: aiUser._id,
+          previousStatus: complaint.status,
+          newStatus: complaint.status,
+          remarks: note
+        });
+
+        // Write to Audit Trail with "auto_routed_by_ai" actor
+        await AuditLog.create({
+          actor: aiUser._id,
+          entityType: 'complaint',
+          entityId: complaint._id,
+          fromStatus: 'Received',
+          toStatus: 'Received (Auto-Routed)',
+          note: note
+        });
+      } else {
+        complaint.aiReviewStatus = 'needs_review';
+      }
+    } else {
+      // 2. Needs Review (Triage)
+      complaint.department = null; // Unassign so it enters triage queue
+      complaint.aiReviewStatus = 'needs_review';
+
+      const note = `AI Photo Analysis completed with low confidence (${(analysis.confidence * 100).toFixed(0)}%). Sent to Nodal Triage queue.`;
+
+      await ComplaintTimeline.create({
+        complaint: complaint._id,
+        actor: aiUser._id,
+        previousStatus: complaint.status,
+        newStatus: complaint.status,
+        remarks: note
+      });
+    }
+
+    await complaint.save();
+    console.log(`AI photo-analysis complete for complaint ${complaint.complaintNumber}. Status: ${complaint.aiReviewStatus}`);
+    
+    if (io) {
+      io.emit('complaint:analyzed', { complaintId, status: complaint.aiReviewStatus });
+    }
+  } catch (err) {
+    console.error('Background photo analysis exception:', err);
+  }
+}
+
+// POST /api/complaints
+exports.createComplaint = async (req, res) => {
+  try {
+    const { description, category, lat, lng, area, priority } = req.body;
+    
+    if (!description || !lat || !lng) {
+      return res.status(400).json({ error: 'Description, latitude, and longitude are required.' });
+    }
+
+    const complaintType = mapCategoryToType(category);
+    const coordinates = [parseFloat(lng), parseFloat(lat)];
+    const photoUrl = req.file ? `/uploads/${req.file.filename}` : null;
+
+    // Phase 5 Proximity / Ward Default assignment (saved as initial fallback)
+    let assignedDepartmentId = null;
+    let assignmentNote = '';
+    
+    const nearestPermit = await Permit.findOne({
+      location: {
+        $near: {
+          $geometry: { type: 'Point', coordinates },
+          $maxDistance: 500
+        }
+      },
+      status: { $in: ['Approved', 'Active'] }
+    }).populate('department');
+
+    const containingWard = await Ward.findOne({
+      boundary: {
+        $geoIntersects: {
+          $geometry: { type: 'Point', coordinates }
+        }
+      }
+    }).populate('defaultDepartment');
+
+    if (nearestPermit && nearestPermit.department) {
+      assignedDepartmentId = nearestPermit.department._id;
+      assignmentNote = `Auto-assigned to ${nearestPermit.department.name} due to proximity to active Permit (${nearestPermit.permitNumber})`;
+    } else if (containingWard && containingWard.defaultDepartment) {
+      assignedDepartmentId = containingWard.defaultDepartment._id;
+      assignmentNote = `Auto-assigned to ${containingWard.defaultDepartment.name} (default department for ${containingWard.name})`;
+    } else {
+      const bmcDept = await Department.findOne({ name: 'BMC' });
+      assignedDepartmentId = bmcDept ? bmcDept._id : null;
+      assignmentNote = `Auto-assigned to default department (BMC) as no nearby active permits or ward mappings were found.`;
+    }
+
+    let wardId = containingWard ? containingWard._id : null;
+    if (!wardId) {
+      const anyWard = await Ward.findOne();
+      if (anyWard) wardId = anyWard._id;
+    }
+
+    const complaintNumber = `CMP-${Math.floor(100000 + Math.random() * 900000)}`;
+
+    const complaint = await Complaint.create({
       complaintNumber,
       citizen: req.user._id,
-      description,
-      location: {
-        type: 'Point',
-        coordinates: [Number(longitude), Number(latitude)],
-      },
-      ward,
+      department: assignedDepartmentId,
       complaintType,
-      department: assignedDeptId,
+      description,
+      location: { type: 'Point', coordinates },
+      photoUrl,
+      ward: wardId,
       priority: priority || 'Medium',
       status: 'Received',
+      slaDeadline: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+      aiReviewStatus: photoUrl ? 'not_analyzed' : 'not_analyzed'
     });
 
-    // Handle photo attachments in Attachment collection if photoUrl exists
-    // We can link it later or write it directly
-
-    // Initial timeline log
+    // Save initial timeline step
     await ComplaintTimeline.create({
       complaint: complaint._id,
       actor: req.user._id,
       previousStatus: null,
       newStatus: 'Received',
-      remarks: 'Complaint registered successfully by Citizen.'
+      remarks: assignmentNote,
     });
 
-    // Track activity
-    await ActivityLogRepository.log(
-      req.user._id,
-      'REPORT_COMPLAINT',
-      `Citizen submitted complaint '${complaintNumber}' of type: ${complaintType}`,
-      req.ip
-    );
+    // Write to Audit Trail
+    await AuditLog.create({
+      actor: req.user._id,
+      entityType: 'complaint',
+      entityId: complaint._id,
+      fromStatus: 'None',
+      toStatus: 'Received',
+      note: assignmentNote,
+    });
 
-    const populatedComplaint = await ComplaintRepository.findByIdWithDetails(complaint._id);
-
-    // Socket Notifications
-    const io = getIO();
-    if (io) {
-      const notification = await NotificationRepository.create({
-        recipientDepartment: assignedDeptId,
-        title: 'New Complaint Received',
-        message: `A new complaint of type ${complaintType} has been assigned to your department.`,
-        type: 'ComplaintStatus',
-        metadata: { complaintId: complaint._id },
-      });
-
-      io.to(`dept_${assignedDeptId.toString()}`).emit('notification', notification);
-      io.to('role_Super_Admin').emit('notification', notification);
-      io.emit('complaint_created', populatedComplaint);
+    // Fire background AI photo-analysis asynchronously (DO NOT block the HTTP response)
+    const io = req.app.get('io');
+    if (photoUrl) {
+      // Async trigger
+      analyzeComplaintPhotoInBackground(complaint._id, io);
+    } else {
+      if (io) io.emit('complaint:created', complaint);
     }
 
-    res.status(201).json({
-      success: true,
-      data: populatedComplaint,
-    });
-  } catch (error) {
-    next(error);
+    res.status(201).json(complaint);
+  } catch (err) {
+    console.error('Create complaint error:', err);
+    res.status(500).json({ error: err.message });
   }
 };
 
-// @desc    Get all complaints
-// @route   GET /api/complaints
-// @access  Private
-export const getComplaints = async (req, res, next) => {
+// GET /api/complaints
+exports.getComplaints = async (req, res) => {
   try {
-    const queryObj = {};
-    const roleName = req.user.role && typeof req.user.role === 'object' ? req.user.role.name : req.user.role;
+    let query = { isDeleted: { $ne: true } };
 
-    if (roleName === 'Citizen') {
-      queryObj.citizen = req.user._id;
-    } else if (roleName === 'Department Officer') {
-      queryObj.department = req.user.department._id;
-    }
-
-    if (req.query.status) queryObj.status = req.query.status;
-    if (req.query.ward) queryObj.ward = req.query.ward;
-    if (req.query.complaintType) queryObj.complaintType = req.query.complaintType;
-
-    const complaints = await ComplaintRepository.findWithDetails(queryObj);
-
-    res.status(200).json({
-      success: true,
-      count: complaints.length,
-      data: complaints,
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// @desc    Get single complaint details
-// @route   GET /api/complaints/:id
-// @access  Private
-export const getComplaintById = async (req, res, next) => {
-  try {
-    const complaint = await ComplaintRepository.findByIdWithDetails(req.params.id);
-    if (!complaint) {
-      return next(new AppError(`Complaint not found with id of ${req.params.id}`, 404, 'COMPLAINT_NOT_FOUND'));
-    }
-
-    const roleName = req.user.role && typeof req.user.role === 'object' ? req.user.role.name : req.user.role;
-
-    // RBAC Checks
-    if (roleName === 'Citizen' && complaint.citizen._id.toString() !== req.user._id.toString()) {
-      return next(new AppError('Not authorized to access this complaint', 403, 'FORBIDDEN'));
-    }
-
-    if (roleName === 'Department Officer' && complaint.department._id.toString() !== req.user.department._id.toString()) {
-      return next(new AppError('Not authorized to access this department complaint', 403, 'FORBIDDEN'));
-    }
-
-    // Fetch timeline logs
-    const timeline = await ComplaintTimeline.find({ complaint: complaint._id }).populate('actor', 'name role').sort('createdAt');
-
-    // Fetch feedback
-    const feedback = await Feedback.findOne({ complaint: complaint._id }).populate('citizen', 'name');
-
-    res.status(200).json({
-      success: true,
-      data: {
-        ...complaint.toObject(),
-        timeline,
-        feedback
-      },
-    });
-  } catch (error) {
-    next(error);
-  }
-};
-
-// @desc    Update complaint status
-// @route   PUT /api/complaints/:id/status
-// @access  Private (Department Officer / Super Admin)
-export const updateComplaintStatus = async (req, res, next) => {
-  try {
-    const { status, remarks } = req.body;
-
-    const complaint = await ComplaintRepository.findByIdWithDetails(req.params.id);
-    if (!complaint) {
-      return next(new AppError(`Complaint not found with id of ${req.params.id}`, 404, 'COMPLAINT_NOT_FOUND'));
-    }
-
-    const roleName = req.user.role && typeof req.user.role === 'object' ? req.user.role.name : req.user.role;
-
-    if (roleName === 'Department Officer') {
-      if (complaint.department._id.toString() !== req.user.department._id.toString()) {
-        return next(new AppError('Not authorized to update complaints for other departments', 403, 'FORBIDDEN'));
+    // Role-based visibility
+    if (req.user.role === 'citizen') {
+      query.citizen = req.user._id;
+    } else if (req.user.role === 'officer' || req.user.role === 'dept_admin') {
+      if (!req.user.department) {
+        return res.status(400).json({ error: 'Officer/Admin must belong to a department.' });
       }
+      query.department = req.user.department;
+      query.aiReviewStatus = { $ne: 'needs_review' }; // Hide complaints pending nodal triage
     }
+
+    const complaints = await Complaint.find(query)
+      .populate('citizen', 'fullName email')
+      .populate('department', 'name')
+      .populate('ward', 'name number')
+      .sort({ createdAt: -1 });
+
+    res.json(complaints);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// GET /api/complaints/:id
+exports.getComplaintById = async (req, res) => {
+  try {
+    const complaint = await Complaint.findById(req.params.id)
+      .populate('citizen', 'fullName email')
+      .populate('department', 'name')
+      .populate('ward', 'name number');
+
+    if (!complaint) return res.status(404).json({ error: 'Complaint not found.' });
+
+    // Validate access
+    if (req.user.role === 'citizen' && complaint.citizen._id.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Unauthorized.' });
+    }
+    if ((req.user.role === 'officer' || req.user.role === 'dept_admin') && 
+        complaint.department && complaint.department._id.toString() !== req.user.department.toString()) {
+      return res.status(403).json({ error: 'Unauthorized.' });
+    }
+
+    const timeline = await ComplaintTimeline.find({ complaint: complaint._id })
+      .populate('actor', 'fullName role')
+      .sort({ createdAt: 1 });
+
+    res.json({ complaint, timeline });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// PATCH /api/complaints/:id/status
+exports.updateComplaintStatus = async (req, res) => {
+  try {
+    const { status, note } = req.body;
+    if (!status) return res.status(400).json({ error: 'Status is required.' });
+
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) return res.status(404).json({ error: 'Complaint not found.' });
 
     const previousStatus = complaint.status;
     complaint.status = status;
     await complaint.save();
 
-    // Log timeline transition
+    const remarks = note || `Status updated from ${previousStatus} to ${status}`;
+
+    // Call OpenAI Assistant Service to generate conversational citizen update
+    let aiMessage = '';
+    try {
+      aiMessage = await openaiAssistantService.generateStatusMessage(previousStatus, status, complaint.complaintType, 'Bhopal');
+    } catch (err) {
+      aiMessage = `Your complaint status has changed from '${previousStatus}' to '${status}'.`;
+    }
+
+    // Append to timeline
     await ComplaintTimeline.create({
       complaint: complaint._id,
       actor: req.user._id,
       previousStatus,
       newStatus: status,
-      remarks: remarks || `Status transitioned to ${status}.`
+      remarks,
+      message: aiMessage
     });
 
-    // Track activity
-    await ActivityLogRepository.log(
-      req.user._id,
-      'UPDATE_COMPLAINT_STATUS',
-      `Updated complaint ${complaint.complaintNumber} status to ${status}`,
-      req.ip
-    );
+    // Write Status Change to Audit Trail
+    await AuditLog.create({
+      actor: req.user._id,
+      entityType: 'complaint',
+      entityId: complaint._id,
+      fromStatus: previousStatus,
+      toStatus: status,
+      note: remarks,
+    });
 
-    const updatedComplaint = await ComplaintRepository.findByIdWithDetails(complaint._id);
+    // Create Notification for the citizen
+    await Notification.create({
+      recipient: complaint.citizen,
+      title: status === 'Resolved' ? 'Work Completed 🎉' : 'Complaint Status Update',
+      message: aiMessage,
+      type: 'ComplaintStatus',
+      metadata: { complaintId: complaint._id }
+    });
 
-    // Socket notification
-    const io = getIO();
+    const io = req.app.get('io');
     if (io) {
-      const notification = await NotificationRepository.create({
-        recipient: complaint.citizen._id,
-        title: 'Complaint Status Updated',
-        message: `Your complaint ${complaint.complaintNumber} has been updated to: ${status}. Remarks: ${remarks || ''}`,
-        type: 'ComplaintStatus',
-        metadata: { complaintId: complaint._id },
+      io.emit('complaint:updated', {
+        complaintId: complaint._id,
+        status,
+        remarks,
+        message: aiMessage,
+        citizenId: complaint.citizen,
       });
-
-      io.to(`user_${complaint.citizen._id.toString()}`).emit('notification', notification);
-      io.to(`user_${complaint.citizen._id.toString()}`).emit('complaint_status_changed', updatedComplaint);
-      io.emit('complaint_updated', updatedComplaint);
     }
 
-    res.status(200).json({
-      success: true,
-      data: updatedComplaint,
-    });
-  } catch (error) {
-    next(error);
+    res.json(complaint);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 };
 
-// @desc    Submit rating and feedback
-// @route   POST /api/complaints/:id/feedback
-// @access  Private (Citizen)
-export const rateComplaint = async (req, res, next) => {
+// POST /api/complaints/:id/rate
+exports.rateComplaint = async (req, res) => {
   try {
     const { rating, comment } = req.body;
+    if (!rating) return res.status(400).json({ error: 'Rating is required.' });
 
-    const complaint = await ComplaintRepository.findById(req.params.id);
-    if (!complaint) {
-      return next(new AppError(`Complaint not found with id of ${req.params.id}`, 404, 'COMPLAINT_NOT_FOUND'));
-    }
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) return res.status(404).json({ error: 'Complaint not found.' });
 
-    // Ensure user is the reporter of the complaint
     if (complaint.citizen.toString() !== req.user._id.toString()) {
-      return next(new AppError('You can only rate your own complaints', 403, 'FORBIDDEN'));
+      return res.status(403).json({ error: 'Only the citizen who filed this complaint can submit feedback.' });
     }
 
-    // Ensure complaint is resolved
     if (complaint.status !== 'Resolved') {
-      return next(new AppError('You can only rate complaints that have been resolved', 400, 'BAD_REQUEST'));
+      return res.status(400).json({ error: 'You can only rate a complaint after it has been marked as Resolved.' });
     }
 
-    // Check if feedback already submitted
-    const existingFeedback = await Feedback.findOne({ complaint: complaint._id });
-    if (existingFeedback) {
-      return next(new AppError('Feedback already submitted for this complaint', 400, 'BAD_REQUEST'));
+    complaint.rating = rating;
+    complaint.ratingComment = comment || '';
+    await complaint.save();
+
+    await AuditLog.create({
+      actor: req.user._id,
+      entityType: 'complaint',
+      entityId: complaint._id,
+      fromStatus: 'Resolved',
+      toStatus: 'Resolved (Rated)',
+      note: `Citizen rated: ${rating} stars. Comment: ${comment || 'none'}`,
+    });
+
+    res.json(complaint);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// POST /api/complaints/:id/confirm-triage (Nodal Admin reassigns and confirms triage)
+exports.confirmTriage = async (req, res) => {
+  try {
+    if (req.user.role !== 'admin' && req.user.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Only Nodal Admins can confirm triage.' });
     }
 
-    const feedback = await Feedback.create({
+    const { departmentId, note } = req.body;
+    if (!departmentId) return res.status(400).json({ error: 'Department ID is required.' });
+
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) return res.status(404).json({ error: 'Complaint not found.' });
+
+    const deptDoc = await Department.findById(departmentId);
+    if (!deptDoc) return res.status(404).json({ error: 'Department not found.' });
+
+    const remarks = note || `Nodal admin resolved triage and assigned to ${deptDoc.name}`;
+    complaint.department = deptDoc._id;
+    complaint.aiReviewStatus = 'auto_routed'; // Marks triage resolved
+    await complaint.save();
+
+    // Call OpenAI Assistant Service to generate conversational citizen update
+    let aiMessage = '';
+    try {
+      aiMessage = await openaiAssistantService.generateStatusMessage('Needs Triage', 'Assigned', complaint.complaintType, 'Bhopal');
+    } catch (err) {
+      aiMessage = `Your complaint was manually triaged and assigned to ${deptDoc.name}.`;
+    }
+
+    // Append to timeline
+    await ComplaintTimeline.create({
       complaint: complaint._id,
-      citizen: req.user._id,
-      rating: Number(rating),
-      comment: comment || '',
+      actor: req.user._id,
+      previousStatus: 'Received (Needs Review)',
+      newStatus: complaint.status,
+      remarks,
+      message: aiMessage
     });
 
-    // Track activity
-    await ActivityLogRepository.log(
-      req.user._id,
-      'RATE_COMPLAINT',
-      `Rated resolved complaint ${complaint.complaintNumber} with score: ${rating}`,
-      req.ip
-    );
-
-    res.status(200).json({
-      success: true,
-      data: feedback,
+    // Write to Audit Trail
+    await AuditLog.create({
+      actor: req.user._id,
+      entityType: 'complaint',
+      entityId: complaint._id,
+      fromStatus: 'Received (Needs Review)',
+      toStatus: 'Received (Assigned)',
+      note: remarks,
     });
-  } catch (error) {
-    next(error);
+
+    // Create Notification for the citizen
+    await Notification.create({
+      recipient: complaint.citizen,
+      title: 'Complaint Assigned',
+      message: aiMessage,
+      type: 'ComplaintStatus',
+      metadata: { complaintId: complaint._id }
+    });
+
+    const io = req.app.get('io');
+    if (io) {
+      io.emit('complaint:updated', {
+        complaintId: complaint._id,
+        status: complaint.status,
+        remarks,
+        message: aiMessage,
+        citizenId: complaint.citizen,
+      });
+    }
+
+    res.json(complaint);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// PATCH /api/complaints/:id/reassign (Manually reassign complaint department)
+exports.reassignComplaint = async (req, res) => {
+  try {
+    if (req.user.role !== 'admin' && req.user.role !== 'super_admin' && req.user.role !== 'dept_admin') {
+      return res.status(403).json({ error: 'Unauthorized to reassign department.' });
+    }
+    const { departmentId, note } = req.body;
+    if (!departmentId) return res.status(400).json({ error: 'Department ID is required.' });
+
+    const complaint = await Complaint.findById(req.params.id);
+    if (!complaint) return res.status(404).json({ error: 'Complaint not found.' });
+
+    const prevDept = await Department.findById(complaint.department);
+    const newDept = await Department.findById(departmentId);
+    if (!newDept) return res.status(404).json({ error: 'Target department not found.' });
+
+    complaint.department = newDept._id;
+    // Set review status to auto_routed/completed to indicate it is assigned
+    complaint.aiReviewStatus = 'auto_routed';
+    await complaint.save();
+
+    const remarks = note || `Manually reassigned from ${prevDept ? prevDept.name : 'None'} to ${newDept.name}`;
+
+    await ComplaintTimeline.create({
+      complaint: complaint._id,
+      actor: req.user._id,
+      previousStatus: complaint.status,
+      newStatus: complaint.status,
+      remarks
+    });
+
+    await AuditLog.create({
+      actor: req.user._id,
+      entityType: 'complaint',
+      entityId: complaint._id,
+      fromStatus: `Assigned (${prevDept ? prevDept.name : 'None'})`,
+      toStatus: `Assigned (${newDept.name})`,
+      note: remarks
+    });
+
+    res.json(complaint);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+};
+
+// GET /api/audit-logs
+exports.getAuditLogs = async (req, res) => {
+  try {
+    if (req.user.role !== 'admin' && req.user.role !== 'super_admin') {
+      return res.status(403).json({ error: 'Access denied. Nodal Admin privileges required.' });
+    }
+
+    const logs = await AuditLog.find()
+      .populate('actor', 'fullName email role')
+      .sort({ createdAt: -1 })
+      .limit(500);
+
+    res.json(logs);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 };

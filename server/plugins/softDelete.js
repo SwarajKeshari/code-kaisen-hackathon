@@ -1,4 +1,4 @@
-export default function softDeletePlugin(schema) {
+function softDeletePlugin(schema) {
   schema.pre('find', function() {
     this.where({ isDeleted: { $ne: true } });
   });
@@ -16,3 +16,5 @@ export default function softDeletePlugin(schema) {
     next();
   });
 }
+
+module.exports = softDeletePlugin;
